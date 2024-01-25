@@ -1,5 +1,5 @@
 import tkinter as tk
-from tkinter import ttk, messagebox, scrolledtext
+from tkinter import ttk, messagebox, scrolledtext, filedialog
 import json
 import os
 from netmiko import ConnectHandler, NetmikoTimeoutException, NetmikoAuthenticationException
@@ -7,20 +7,20 @@ import re
 import sqlite3
 from openpyxl import Workbook
 import xlsxwriter
+import tkinter.filedialog
+from threading import Thread
 
-# Obtener la ruta absoluta del directorio donde se encuentra el script
+# Configuración inicial
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-
-# Construir la ruta completa al archivo switches.db y users.json
-DATABASE_NAME = "switches.db"
-DATABASE_NAME = os.path.join(BASE_DIR, "switches.db")
+DATABASE_NAME = os.path.join(os.getcwd(), "switches.db")
 USERS_FILE = os.path.join(BASE_DIR, "users.json")
 
 # Variables globales
 connection = None
-reporte = {}  # <-- Aquí declaramos reporte
-tabla_reporte = None  # <-- Añadido
+reporte = {}  
+tabla_reporte = None  
 entry_busqueda = None
+detalle_win = None
 
 # Cargar usuarios del archivo
 if os.path.exists(USERS_FILE):
@@ -29,9 +29,107 @@ if os.path.exists(USERS_FILE):
 else:
     users = {}
 
-
-
 # Funciones de de gestiones de comandos def
+
+def guardar_log(mensaje):
+    with open(os.path.join(os.getcwd(), "failed_ips.log"), "a") as log_file:
+        log_file.write(mensaje + "\n")
+
+def load_ips_from_file(progress_bar):
+    global reporte
+    status_label.config(text="Procesando...")  # Indicador de inicio del procesamiento
+    file_path = tkinter.filedialog.askopenfilename(filetypes=[('Text files', '*.txt')])
+    if not file_path:
+        status_label.config(text="¡Terminado!")  # Indicador de finalización
+        return
+    
+    with open(file_path, 'r') as file:
+        ips = file.readlines()
+    ips_list = [ip.strip() for ip in ips if ip.strip()]
+
+    if not ips_list:
+        output.insert(tk.END, "No se cargaron IPs o la lista está vacía.\n")
+        status_label.config(text="¡Terminado!")  # Indicador de finalización
+        return
+    
+    user = combo_users.get()
+    password = entry_password.get()
+    if not user or not password:
+        output.insert(tk.END, "Por favor, ingrese un usuario y contraseña válidos.\n")
+        status_label.config(text="¡Terminado!")  # Indicador de finalización
+        return
+
+    # Iniciar la barra de progreso desde 0
+    progress_bar['value'] = 0
+    progress_bar['maximum'] = len(ips_list)
+
+    def update_progress_bar():
+        progress_bar['value'] += 1
+        app.update_idletasks()
+
+    failed_ips = []  # Lista para almacenar las IPs que fallaron en la conexión
+
+    for ip in ips_list:
+        device = {
+            'device_type': 'cisco_ios',
+            'ip': ip,
+            'username': user,
+            'password': password,
+        }
+
+        try:
+            output.insert(tk.END, f"Intentando conectar a {ip}...\n")
+            connection = ConnectHandler(**device)
+            output.insert(tk.END, f"Conectado exitosamente a {ip}\n")
+            output.insert(tk.END, f"Generando reporte para {ip}...\n")
+            generar_reporte(connection, ip)
+            guardar_en_db(reporte)
+            output.insert(tk.END, f"Reporte generado y guardado para {ip}\n")
+        except NetmikoTimeoutException:
+            output.insert(tk.END, f"Tiempo de espera excedido al intentar conectar a {ip}\n")
+            guardar_log(f"Tiempo de espera excedido al intentar conectar a {ip}")
+            failed_ips.append(ip)
+        except NetmikoAuthenticationException:
+            output.insert(tk.END, "Error de autenticación. Verifica usuario y contraseña.\n")
+            failed_ips.append(ip)
+        except Exception as e:
+            output.insert(tk.END, f"Error no previsto en {ip}: {str(e)}\n")
+            failed_ips.append(ip)
+        
+        update_progress_bar()
+
+    if failed_ips:
+        output.insert(tk.END, f"Las siguientes IPs fallaron: {', '.join(failed_ips)}\n")
+    status_label.config(text="¡Terminado!")  # Indicador de finalización
+
+def conectar_multiple():
+    disconnect() 
+    global output, reporte  # Añadido reporte
+    ips_list = load_ips_from_file()
+
+    # Verificamos que la lista no esté vacía
+    if not ips_list:
+        output.insert(tk.END, "No se cargaron IPs o la lista está vacía.\n")
+        return
+
+    # Iteramos sobre las IPs
+    for ip in ips_list:
+        device = {
+            'device_type': 'cisco_ios',
+            'ip': ip,
+            'username': combo_users.get(),
+            'password': entry_password.get(),
+        }
+
+        try:
+            connection = ConnectHandler(**device)
+            output.insert(tk.END, f"Conectado exitosamente a {ip}\n")
+            generar_reporte(ip)  # Modificado para incluir la IP
+            guardar_en_db(reporte)
+        except NetmikoTimeoutException:
+            output.insert(tk.END, f"Tiempo de espera excedido al intentar conectar a {ip}\n")
+        except NetmikoAuthenticationException:
+            output.insert(tk.END, "Error de autenticación. Verifica usuario y contraseña.\n")
 
 def ver_informe():
     informe_win = tk.Toplevel(app)
@@ -86,23 +184,42 @@ def ver_informe():
         conn.close()
     
     def exportar_a_excel():
-        filename = "Informe_Switches.xlsx"
-        
-        workbook = xlsxwriter.Workbook(filename)
-        worksheet = workbook.add_worksheet()
+        try:
+            conn = sqlite3.connect(DATABASE_NAME)
+            cursor = conn.cursor()
 
-        headers = ["IP", "Hostname", "Version", "Modelo", "Serial", "Mac", "Switcher"]
-        for col_num, header in enumerate(headers):
-            worksheet.write(0, col_num, header)
+            # Consulta para obtener todos los datos de SwitchMaster y SwitchDetails
+            query = """
+            SELECT 
+                sm.ip, sm.nemonico AS Hostname, sm.version, sd.model_number AS Modelo, 
+                sd.serial_number AS Serial, sd.mac_address AS Mac, 
+                ROW_NUMBER() OVER(PARTITION BY sm.ip ORDER BY sd.id) AS Switcher
+            FROM SwitchMaster AS sm
+            JOIN SwitchDetails AS sd ON sm.id = sd.master_id
+            """
 
-        for row_num, row in enumerate(tree.get_children(), 1):
-            values = tree.item(row, "values")
-            for col_num, cell_value in enumerate(values):
-                worksheet.write(row_num, col_num, cell_value)
+            cursor.execute(query)
+            rows = cursor.fetchall()
 
-        workbook.close()
+            with xlsxwriter.Workbook('Switch_Report.xlsx') as workbook:
+                worksheet = workbook.add_worksheet("Switch Details")
 
-        messagebox.showinfo("Información", f"Informe exportado exitosamente como {filename}")
+                # Escribir encabezados
+                headers = ["IP", "Hostname", "Version", "Modelo", "Serial", "Mac", "Switcher"]
+                for col_num, header in enumerate(headers):
+                    worksheet.write(0, col_num, header)
+
+                # Escribir datos
+                for row_num, row_data in enumerate(rows, 1):
+                    for col_num, cell_data in enumerate(row_data):
+                        worksheet.write(row_num, col_num, cell_data)
+
+            messagebox.showinfo("Información", "Datos exportados correctamente a 'Switch_Report.xlsx'")
+
+        except Exception as e:
+            messagebox.showerror("Error", f"Ocurrió un error: {e}")
+        finally:
+            conn.close()
 
     frame_buscar = ttk.Frame(informe_win)
     frame_buscar.pack(pady=20)
@@ -193,19 +310,22 @@ def mostrar_detalles(event):
         conn.close()
 
 def init_db():
+    # Establece la conexión con la base de datos.
     conn = sqlite3.connect(DATABASE_NAME)
     cursor = conn.cursor()
 
+    # Crea la tabla SwitchMaster si no existe.
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS SwitchMaster (
         id INTEGER PRIMARY KEY,
-        ip TEXT NOT NULL,
+        ip TEXT NOT NULL UNIQUE,  
         nemonico TEXT,
         version TEXT,
         num_switches INTEGER
     )
     """)
 
+    # Crea la tabla SwitchDetails si no existe.
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS SwitchDetails (
         id INTEGER PRIMARY KEY,
@@ -217,51 +337,52 @@ def init_db():
     )
     """)
 
+    # Guarda los cambios y cierra la conexión.
     conn.commit()
     conn.close()
 
+    print(f"Base de datos inicializada en: {DATABASE_NAME}")
+
+# Llamada a la función para inicializar la base de datos
 init_db()
 
 def guardar_en_db(data):
+    # Establecer conexión con la base de datos
     conn = sqlite3.connect(DATABASE_NAME)
-    cursor = conn.cursor()
-    
-    # Verificar si ya existe un registro con la misma IP
-    cursor.execute("SELECT id FROM SwitchMaster WHERE ip = ?", (data["ip"],))
-    existente = cursor.fetchone()
-    if existente:
-        # Si existe, mostramos un mensaje y no hacemos nada más
-        messagebox.showwarning("Advertencia", "Ya existe un reporte para esta IP. No se ha guardado ningún dato nuevo.")
-        conn.close()
-        return
-    
-    # Si no existe, insertamos el nuevo registro
-    cursor.execute("""
-    INSERT INTO SwitchMaster (ip, nemonico, version, num_switches)
-    VALUES (?, ?, ?, ?)
-    """, (data["ip"], data["nemonico"], data["version"], data["num_switches"]))
-    master_id = cursor.lastrowid  # ID del registro que acabamos de insertar
+    c = conn.cursor()
 
-    for switch in data["switches"]:
-        cursor.execute("""
-        INSERT INTO SwitchDetails (master_id, mac_address, model_number, serial_number)
-        VALUES (?, ?, ?, ?)
-        """, (master_id, switch["mac_address"], switch.get("model_number", ""), switch.get("serial_number", "")))
+    # Verificar si la IP ya existe en la base de datos
+    c.execute("SELECT id FROM SwitchMaster WHERE ip = ?", (data['ip'],))
+    existing_id = c.fetchone()
+    if existing_id:
+        master_id = existing_id[0]
+        # Si existe, borrar todos los detalles asociados a esa IP
+        c.execute("DELETE FROM SwitchDetails WHERE master_id = ?", (master_id,))
+    else:
+        # Si no existe, insertar en SwitchMaster y obtener el ID
+        c.execute("INSERT INTO SwitchMaster (ip, nemonico, version, num_switches) VALUES (?, ?, ?, ?)",
+                  (data['ip'], data['nemonico'], data['version'], data['num_switches']))
+        master_id = c.lastrowid
 
+    for switch in data['switches']:
+        c.execute("INSERT INTO SwitchDetails (master_id, mac_address, model_number, serial_number) VALUES (?, ?, ?, ?)",
+                  (master_id, switch['mac_address'], switch['model_number'], switch['serial_number']))
+
+    # Guardar los cambios y cerrar la conexión
     conn.commit()
     conn.close()
-    
-    # Mostrar un mensaje de éxito
-    messagebox.showinfo("Información", "Reporte guardado exitosamente.")
+    output.insert(tk.END, f"Datos guardados exitosamente para la IP {data['ip']}.\n")
+
 
 def conectar():
+    disconnect()
     global connection
     ip = entry_ip.get()
     user = combo_users.get()
     password = entry_password.get()
 
     device = {
-        'device_type': 'cisco_ios',  # Asumiendo que es un Cisco IOS, pero esto puede cambiar según el switch
+        'device_type': 'cisco_ios',
         'ip': ip,
         'username': user,
         'password': password,
@@ -284,12 +405,12 @@ def actualizar_password(event):
            
 def enviar_comando():
     output.delete(1.0, tk.END)  # Limpiar el área de output
-    if connection:
-        comando = entry_comando.get()
-        respuesta = connection.send_command(comando)
-        output.insert(tk.END, f"Enviado: {comando}\nRecibido: {respuesta}\n")
-    else:
+    if not connection:
         output.insert(tk.END, "Por favor, conecta primero al dispositivo.\n")
+        return
+    comando = entry_comando.get()
+    respuesta = connection.send_command(comando)
+    output.insert(tk.END, f"Enviado: {comando}\nRecibido: {respuesta}\n")
 
 def agregar_usuario():
     global users  # Es importante referenciar la variable global
@@ -308,21 +429,24 @@ def agregar_usuario():
     else:
         messagebox.showwarning("Advertencia", "Por favor, ingresa un usuario y contraseña")
 
-def generar_reporte():
-    global reporte  # <-- Declaramos reporte como global aquí
+def generar_reporte(connection, ip):
+    global reporte
     if connection:
         comando = "show version"
         respuesta = connection.send_command(comando)
-        reporte = procesar_show_version(respuesta)
-        reporte["ip"] = entry_ip.get()
+        reporte = procesar_show_version(respuesta)  # Aquí llamamos a procesar_show_version con un solo argumento
+        reporte["ip"] = ip  # Añadido para establecer la IP en el reporte
         output.delete(1.0, tk.END)  # Limpiar el output
-        output.insert(tk.END, json.dumps(reporte, indent=4))  
+        output.insert(tk.END, json.dumps(reporte, indent=4))
+        
+        guardar_en_db(reporte)  # Esta es la correcta ubicación para guardar el reporte en la base de datos
+        connection.disconnect()  # Close the connection after processing
     else:
         output.insert(tk.END, "Por favor, conecta primero al dispositivo.\n")
 
-def procesar_show_version(output):
-    reporte = {"nemonico": "", "version": "", "num_switches": 0, "switches": []}
-
+def procesar_show_version(output, ip):
+    reporte = {"nemonico": "", "version": "", "num_switches": 0, "switches": [], "ip": ip}  # Agregamos el campo "ip"
+    
     # 1. Obtener el nemónico
     nemonico_match = re.search(r"(\w+-\w+-\w+) uptime", output)
     if nemonico_match:
@@ -358,15 +482,23 @@ def procesar_show_version(output):
     reporte["num_switches"] = len(reporte["switches"])        
     return reporte
 
+def disconnect():
+    global connection
+    if connection:
+        try:
+            connection.disconnect()
+            output.insert(tk.END, "Desconectado exitosamente.\n")
+        except Exception as e:
+            output.insert(tk.END, f"Error al desconectar: {str(e)}\n")
 
 # Interfaz del Programas
 
 app = tk.Tk()
+app.title('NetAnalyzer')  # Set a title for the window
 app.title("NetAnalyzer")
 app.geometry("1000x800")
 app.grid_rowconfigure(2, weight=1)
 app.grid_columnconfigure(0, weight=1)
-
 
 # label, botoenes, frame y combobox
 
@@ -376,22 +508,66 @@ frame.grid(row=0, column=0, padx=10, pady=10, sticky="ew", columnspan=2)
 label_ip = ttk.Label(frame, text="IP:")
 label_ip.grid(row=0, column=0, sticky="w")
 entry_ip = ttk.Entry(frame)
-entry_ip.grid(row=0, column=1, sticky="ew")
+entry_ip.grid(row=0, column=1, sticky="ew", padx=5, pady=5)
+
+label_user = ttk.Label(frame, text="Usuario:")
+label_user.grid(row=1, column=0, sticky="w")
+
+def procesar_show_version(output):
+    reporte = {"nemonico": "", "version": "", "num_switches": 0, "switches": []}
+
+    # 1. Obtener el nemónico
+    nemonico_match = re.search(r"(\S+)[ ]+uptime is", output)
+    if nemonico_match:
+        reporte["nemonico"] = nemonico_match.group(1)
+
+    # 2. Obtener la versión del software
+    version_match = re.search(r"Cisco IOS Software,.*Version (\S+),", output)
+    if version_match:
+        reporte["version"] = version_match.group(1)
+
+    # 3. Extraer secciones de cada switch
+    switch_sections = re.split(r"Switch \d+", output)
+    
+    # 4. Obtener información de cada switch
+    for section_str in switch_sections:
+        mac_address_match = re.search(r"Base ethernet MAC Address\s+:\s+([\w:]+)", section_str)
+        if mac_address_match:
+            switch_data = {"mac_address": mac_address_match.group(1)}
+            model_match = re.search(r"Model number\s+:\s+(\w+-\w+-\w+-\w+)", section_str)
+            if model_match:
+                switch_data["model_number"] = model_match.group(1)
+            serial_match = re.search(r"System serial number\s+:\s+(\w+)", section_str)
+            if serial_match:
+                switch_data["serial_number"] = serial_match.group(1)
+            reporte["switches"].append(switch_data)
+
+    reporte["num_switches"] = len(reporte["switches"])        
+    return reporte
+# label, botoenes, frame y combobox
+
+frame = ttk.LabelFrame(app, text="Conexión")
+frame.grid(row=0, column=0, padx=10, pady=10, sticky="ew", columnspan=2)
+
+label_ip = ttk.Label(frame, text="IP:")
+label_ip.grid(row=0, column=0, sticky="w")
+entry_ip = ttk.Entry(frame)
+entry_ip.grid(row=0, column=1, sticky="ew", padx=5, pady=5)
 
 label_user = ttk.Label(frame, text="Usuario:")
 label_user.grid(row=1, column=0, sticky="w")
 combo_users = ttk.Combobox(frame, values=list(users.keys()))
-combo_users.grid(row=1, column=1, sticky="ew")
+combo_users.grid(row=1, column=1, sticky="ew", padx=5, pady=5)
 combo_users.set("Otro")
 combo_users.bind("<<ComboboxSelected>>", actualizar_password)
 
 label_password = ttk.Label(frame, text="Contraseña:")
 label_password.grid(row=2, column=0, sticky="w")
 entry_password = ttk.Entry(frame, show="*")
-entry_password.grid(row=2, column=1, sticky="ew")
+entry_password.grid(row=2, column=1, sticky="ew", padx=5, pady=5)
 
 btn_conectar = ttk.Button(frame, text="Conectar", command=conectar)
-btn_conectar.grid(row=3, column=1, pady=10, sticky="ew")
+btn_conectar.grid(row=3, column=1, pady=10, sticky="ew", padx=5)
 btn_agregar = ttk.Button(frame, text="Agregar Usuario", command=agregar_usuario)
 btn_agregar.grid(row=3, column=2, pady=10, sticky="ew")
 
@@ -401,12 +577,8 @@ btn_enviar = ttk.Button(app, text="Enviar Comando", command=enviar_comando)
 btn_enviar.grid(row=1, column=1, padx=10, pady=10)
 
 # Botón para generar reporte
-btn_reporte = ttk.Button(app, text="Generar Reporte", command=generar_reporte)
+btn_reporte = ttk.Button(app, text="Generar Reporte", command=lambda: generar_reporte(connection, entry_ip.get()))
 btn_reporte.grid(row=1, column=3, padx=10, pady=5, sticky="ew")
-
-# Botón para guardar el reporte
-btn_guardar = ttk.Button(app, text="Guardar Reporte", command=lambda: guardar_en_db(reporte))
-btn_guardar.grid(row=2, column=3, padx=10, pady=5, sticky="ew")
 
 # Área de texto donde se mostrará el output
 output = scrolledtext.ScrolledText(app, wrap=tk.WORD, width=80, height=30)
@@ -415,5 +587,16 @@ output.grid(row=3, column=0, padx=10, pady=10, sticky="nsew", columnspan=3, rows
 # Botón para abrir ventana de informes
 btn_informe = ttk.Button(app, text="Informe", command=ver_informe)
 btn_informe.grid(row=3, column=3, padx=10, pady=5, sticky="ew")
+
+# Barra de progreso
+progress_bar = ttk.Progressbar(app, orient="horizontal", length=200, mode="determinate")
+progress_bar.grid(row=9, column=0, padx=10, pady=5, sticky="ew", columnspan=4)
+
+# Botón para cargar IPs (modificado para pasar la barra de progreso como argumento)
+btn_load_ips = ttk.Button(app, text="Cargar IPs", command=lambda: load_ips_from_file(progress_bar))
+btn_load_ips.grid(row=0, column=3, padx=10, pady=10)
+
+status_label = ttk.Label(app, text="")
+status_label.grid(row=10, column=0, columnspan=4, pady=10)
 
 app.mainloop()
